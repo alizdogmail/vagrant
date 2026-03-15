@@ -1,0 +1,177 @@
+#!/bin/bash
+#Preparar el servidor Ubuntu 24
+
+#Actualizar el sistema:
+apt update 
+#apt upgrade -y
+apt install curl apt-transport-https ca-certificates gnupg unzip -y
+
+#Añadir repositorio de Elastic:
+curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | \
+gpg --dearmor -o /usr/share/keyrings/elastic-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/elastic-keyring.gpg] \
+https://artifacts.elastic.co/packages/8.x/apt stable main" | \
+tee /etc/apt/sources.list.d/elastic-8.x.list
+
+apt update
+
+#Instalar Elasticsearch
+apt install elasticsearch -y
+
+# Configurar variable java home para elastic
+export ES_JAVA_HOME=/usr/share/elasticsearch/jdk
+echo "ES_JAVA_HOME=/usr/share/elasticsearch/jdk" >> /etc/environment
+
+# Configurar el archivo de configuracion elasticsearch.yml
+sed -i 's/#cluster.name: my-application/cluster.name: elk-cluster/g' /etc/elasticsearch/elasticsearch.yml
+sed -i '24a\discovery.type: single-node' /etc/elasticsearch/elasticsearch.yml
+sed -i 's/#http.port/http.port/g' /etc/elasticsearch/elasticsearch.yml
+sed -i 's/#network.host: 192.168.0.1/network.host: 0.0.0.0/g' /etc/elasticsearch/elasticsearch.yml
+sed -i 's/#discovery./discovery./g' /etc/elasticsearch/elasticsearch.yml
+sed -i 's/"host1", "host2"//g' /etc/elasticsearch/elasticsearch.yml
+sed -i 's/cluster.initial_master_nodes/#cluster.initial_master_nodes/g' /etc/elasticsearch/elasticsearch.yml
+
+sed -i 's/## -Xms4g/-Xms1g/g' /etc/elasticsearch/jvm.options
+sed -i 's/## -Xmx4g/-Xmx2g/g' /etc/elasticsearch/jvm.options
+
+# reinicia el proceso principal de gestión del sistema (PID 1, systemd) sin detener ni afectar a los servicios en ejecución.
+systemctl daemon-reexec
+# Habilita en el reinicio y arranca el servicio 
+systemctl enable elasticsearch
+systemctl start elasticsearch
+
+# Recreamos la contraseña del usuario del usuario elastic la guardamos en una variable para usarla en las configuraciones y por si acaso en un archivo
+PELASTIC=$(/usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -b | awk '{print $3}')
+echo $PELASTIC > /root/pela.txt
+
+
+#Instalar Kibana
+apt install kibana -y
+
+# Añadimos los certificados del elastic pero este paso en princio ya no es necesario
+mkdir /etc/kibana/certs
+cp /etc/elasticsearch/certs/http_ca.crt /etc/kibana/certs/
+chown kibana:kibana /etc/kibana/certs/http_ca.crt
+
+# configuracion del fichero kibana.yml
+sed -i 's/#server.port/server.port/g' /etc/kibana/kibana.yml
+sed -i 's/#server.host: "localhost"/server.host: "0.0.0.0"/g' /etc/kibana/kibana.yml
+
+# Hacemos el enrollment de kibana al elastic
+ENROLLMENT_TOKEN=$(/usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s kibana)
+/usr/share/kibana/bin/kibana-setup --enrollment-token "$ENROLLMENT_TOKEN"
+# Añadimos la clave con que kibana cifrara los objetos
+VAR=$(openssl rand -hex 32)
+echo 'xpack.encryptedSavedObjects.encryptionKey: "'$VAR'"' >> /etc/kibana/kibana.yml
+
+# Habilitamos al reinicio e iniciamos Kibana
+systemctl enable kibana
+systemctl start kibana
+
+
+#Instalar Logstash
+
+apt install logstash -y
+
+cat <<EOF > /etc/logstash/conf.d/beats.conf
+input {
+  beats {
+    port => 5044
+    ssl_enabled => true
+    ssl_certificate => "/etc/logstash/certs/elasticsearch.crt"
+    ssl_key => "/etc/logstash/certs/logstash.pkcs8.key"
+    ssl_client_authentication => "none"
+  }
+}
+filter {
+}
+
+output {
+  elasticsearch {
+    hosts => ["https://localhost:9200"]
+    user => "elastic"
+    password => "contrasena"
+    ssl_enabled => true
+    ssl_certificate_authorities => ["/etc/logstash/certs/http_ca.crt"]
+    index => "filebeat-%{+YYYY.MM.dd}"
+  }
+}
+EOF
+
+cat <<EOF > /usr/share/elasticsearch/instances.yml
+instances:
+  - name: elasticsearch
+    dns:
+      - localhost
+      - srvelkstack
+    ip:
+      - 127.0.0.1
+EOF
+
+
+VAR=$(cut -d" " -f2 /root/pela.txt)
+sed -i "s/contrasena/$VAR/g" /etc/logstash/conf.d/beats.conf
+
+mkdir /etc/logstash/certs
+cp /etc/elasticsearch/certs/http_ca.crt /etc/logstash/certs/
+/usr/share/elasticsearch/bin/elasticsearch-certutil ca --pem --silent --pass "" --out elastic-stack-ca.zip
+cd /usr/share/elasticsearch/
+unzip elastic-stack-ca.zip
+cd ca/
+/usr/share/elasticsearch/bin/elasticsearch-certutil cert --silent --pem --in instances.yml --ca-cert ca/ca.crt --ca-key ca/ca.key --out certs.zip
+cd /usr/share/elasticsearch/
+unzip certs.zip
+cp /usr/share/elasticsearch/ca/* /etc/logstash/certs
+cp /usr/share/elasticsearch/elasticsearch/* /etc/logstash/certs
+cd /etc/logstash/certs
+openssl pkcs8 -inform PEM -in "/etc/logstash/certs/elasticsearch.key" -topk8 -nocrypt -outform PEM -out "/etc/logstash/certs/logstash.pkcs8.key"
+chown logstash: /etc/logstash/certs/*
+chmod 600 /etc/logstash/certs/*
+
+systemctl enable logstash
+systemctl start logstash
+
+
+#Instalar Filebeat
+#En el servidor que envía logs:
+
+apt install filebeat -y
+
+useradd --system --no-create-home --shell /usr/sbin/nologin filebeat
+mkdir -p /var/lib/filebeat/registry
+mkdir -p /var/log/filebeat
+chown -R filebeat:filebeat /var/lib/filebeat /var/log/filebeat
+chmod -R 750 /var/lib/filebeat /var/log/filebeat
+
+sed -i '13a\User=filebeat' /usr/lib/systemd/system/filebeat.service
+sed -i '14a\Group=filebeat' /usr/lib/systemd/system/filebeat.service
+
+systemctl daemon-reload
+
+sed -i 's/type: filestream/type: log/g' /etc/filebeat/filebeat.yml
+sed -i 's/enabled: false/enabled: true/g' /etc/filebeat/filebeat.yml
+sed -i 's/output.elasticsearch/#output.elasticsearch/g' /etc/filebeat/filebeat.yml
+sed -i 's/hosts: \["localhost:9200"\]/#hosts: \["localhost:9200"\]/g' /etc/filebeat/filebeat.yml 
+sed -i 's/#output.logstash/output.logstash/g' /etc/filebeat/filebeat.yml
+sed -i 's/#hosts: \["localhost:5044"\]/hosts: \["localhost:5044"\]/g' /etc/filebeat/filebeat.yml
+sed -i '183a\  ssl.enabled: true' /etc/filebeat/filebeat.yml 
+sed -i '184a\  ssl.certificate_authorities: ["/etc/filebeat/certs/ca.crt"]' /etc/filebeat/filebeat.yml 
+
+mkdir -p /etc/filebeat/certs
+cp /usr/share/elasticsearch/ca/ca.crt /etc/filebeat/certs
+chown filebeat: /etc/filebeat/certs/*
+
+chown -R filebeat:filebeat /var/lib/filebeat /var/log/filebeat
+chmod -R 750 /var/lib/filebeat /var/log/filebeat
+chown root:filebeat /etc/filebeat/filebeat.yml
+chmod 640 /etc/filebeat/filebeat.yml
+
+usermod -aG adm filebeat
+usermod -aG syslog filebeat
+
+systemctl enable filebeat
+systemctl start filebeat
+
+
+
