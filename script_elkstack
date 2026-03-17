@@ -27,7 +27,7 @@ echo "ES_JAVA_HOME=/usr/share/elasticsearch/jdk" >> /etc/environment
 sed -i 's/#cluster.name: my-application/cluster.name: elk-cluster/g' /etc/elasticsearch/elasticsearch.yml
 sed -i '24a\discovery.type: single-node' /etc/elasticsearch/elasticsearch.yml
 sed -i 's/#http.port/http.port/g' /etc/elasticsearch/elasticsearch.yml
-sed -i 's/#network.host: 192.168.0.1/network.host: 0.0.0.0/g' /etc/elasticsearch/elasticsearch.yml
+sed -i 's/#network.host: 192.168.0.1/network.host: 192.168.128.11/g' /etc/elasticsearch/elasticsearch.yml
 sed -i 's/#discovery./discovery./g' /etc/elasticsearch/elasticsearch.yml
 sed -i 's/"host1", "host2"//g' /etc/elasticsearch/elasticsearch.yml
 sed -i 's/cluster.initial_master_nodes/#cluster.initial_master_nodes/g' /etc/elasticsearch/elasticsearch.yml
@@ -79,9 +79,10 @@ input {
   beats {
     port => 5044
     ssl_enabled => true
-    ssl_certificate => "/etc/logstash/certs/elasticsearch.crt"
-    ssl_key => "/etc/logstash/certs/logstash.pkcs8.key"
-    ssl_client_authentication => "none"
+    ssl_certificate => "/etc/logstash/certs/logstash.crt"
+    ssl_key => "/etc/logstash/certs/logstash.key"
+    ssl_certificate_authorities => ["/etc/logstash/certs/ca.crt"]
+    ssl_verify_mode => "force_peer"
   }
 }
 filter {
@@ -114,18 +115,17 @@ VAR=$(cut -d" " -f2 /root/pela.txt)
 sed -i "s/contrasena/$VAR/g" /etc/logstash/conf.d/beats.conf
 
 mkdir /etc/logstash/certs
-cp /etc/elasticsearch/certs/http_ca.crt /etc/logstash/certs/
-/usr/share/elasticsearch/bin/elasticsearch-certutil ca --pem --silent --pass "" --out elastic-stack-ca.zip
-cd /usr/share/elasticsearch/
-unzip elastic-stack-ca.zip
-cd ca/
-/usr/share/elasticsearch/bin/elasticsearch-certutil cert --silent --pem --in instances.yml --ca-cert ca/ca.crt --ca-key ca/ca.key --out certs.zip
-cd /usr/share/elasticsearch/
-unzip certs.zip
-cp /usr/share/elasticsearch/ca/* /etc/logstash/certs
-cp /usr/share/elasticsearch/elasticsearch/* /etc/logstash/certs
 cd /etc/logstash/certs
-openssl pkcs8 -inform PEM -in "/etc/logstash/certs/elasticsearch.key" -topk8 -nocrypt -outform PEM -out "/etc/logstash/certs/logstash.pkcs8.key"
+cp /etc/elasticsearch/certs/http_ca.crt /etc/logstash/certs/
+openssl genrsa -out ca.key 4096
+openssl req -x509 -new -nodes -key ca.key -sha256 -days 3650 -out ca.crt -subj "/CN=ELK-CA"
+openssl genrsa -out logstash.key 2048
+openssl req -new -key logstash.key -out logstash.csr -subj "/CN=192.168.128.11"
+openssl x509 -req -in logstash.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out logstash.crt -days 365 -sha256
+openssl genrsa -out filebeat.key 2048
+openssl req -new -key filebeat.key -out filebeat.csr -subj "/CN=filebeat-client"
+openssl x509 -req -in filebeat.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out filebeat.crt -days 365 -sha256
+
 chown logstash: /etc/logstash/certs/*
 chmod 600 /etc/logstash/certs/*
 
@@ -154,13 +154,21 @@ sed -i 's/enabled: false/enabled: true/g' /etc/filebeat/filebeat.yml
 sed -i 's/output.elasticsearch/#output.elasticsearch/g' /etc/filebeat/filebeat.yml
 sed -i 's/hosts: \["localhost:9200"\]/#hosts: \["localhost:9200"\]/g' /etc/filebeat/filebeat.yml 
 sed -i 's/#output.logstash/output.logstash/g' /etc/filebeat/filebeat.yml
-sed -i 's/#hosts: \["localhost:5044"\]/hosts: \["localhost:5044"\]/g' /etc/filebeat/filebeat.yml
+sed -i 's/#hosts: \["localhost:5044"\]/hosts: \["192.168.128.11:5044"\]/g' /etc/filebeat/filebeat.yml
 sed -i '183a\  ssl.enabled: true' /etc/filebeat/filebeat.yml 
-sed -i '184a\  ssl.certificate_authorities: ["/etc/filebeat/certs/ca.crt"]' /etc/filebeat/filebeat.yml 
+sed -i '184a\  ssl.certificate_authorities: ["/etc/filebeat/certs/ca.crt"]' /etc/filebeat/filebeat.yml
+sed -i '185a\  ssl.certificate: "/etc/filebeat/certs/filebeat.crt"' /etc/filebeat/filebeat.yml
+sed -i '186a\  ssl.key: "/etc/filebeat/certs/filebeat.key"' /etc/filebeat/filebeat.yml
+
 
 mkdir -p /etc/filebeat/certs
-cp /usr/share/elasticsearch/ca/ca.crt /etc/filebeat/certs
+cp /etc/logstash/certs/ca.crt /etc/filebeat/certs
+cp /etc/logstash/certs/filebeat.* /etc/filebeat/certs
 chown filebeat: /etc/filebeat/certs/*
+chmod 600 /etc/filebeat/certs/*
+
+cp /etc/filebeat/certs/* /vagrant
+chown vagrant: /vagrant/*
 
 chown -R filebeat:filebeat /var/lib/filebeat /var/log/filebeat
 chmod -R 750 /var/lib/filebeat /var/log/filebeat
