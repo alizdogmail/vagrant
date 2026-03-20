@@ -5,6 +5,9 @@ apt install apache2 -y
 systemctl enable apache2
 systemctl start apache2
 
+curl http://127.0.0.1
+chown :adm /var/log/apache2/*
+
 apt install php php-mysql libapache2-mod-php php-curl php-gd php-mbstring php-xml php-xmlrpc php-soap php-intl php-zip -y
 apt install mariadb-server mariadb-client -y
 systemctl enable mariadb
